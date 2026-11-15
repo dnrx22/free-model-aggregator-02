@@ -9,7 +9,7 @@ GET /v1/models, routing every request to the best eligible free model
 and failing over when a provider refuses. Exits 0 once the environment
 reports the work done.
 
-Design notes (this is a fresh implementation, written for the -02 entry):
+Design notes (rewritten in full for the -02 round-2 entry):
 
 * Routing is score-based, not a fixed priority list. A request's needs
   (tools, images, JSON mode, estimated context) are counted against
@@ -27,6 +27,12 @@ Design notes (this is a fresh implementation, written for the -02 entry):
   randomness. Response ids and streaming chunk boundaries derive from
   MAKEFUN_TRIAL_SEED plus a per-request counter. ``python3 main.py
   --list`` prints the exact catalog document the server registers.
+
+Round-2 changes over the first entry (same wire behaviour):
+request bodies are capped (413 above the cap), the HTTP client sends a
+User-Agent, Retry-After values are capped, breaker streak backoff is
+capped, 408 is treated as a retryable server error, and OpenAI content
+parts of type ``input_text`` are accepted as text.
 
 Python 3.13, standard library only. All provider traffic stays under
 MAKEFUN_ENV_URL; the server never contacts any other host.
@@ -57,6 +63,10 @@ TRIAL_BUDGET_SECONDS = 170.0
 MAX_BREAKER_WAIT = 5.0
 TEXT_CHUNK = 20
 ARGS_CHUNK = 28
+USER_AGENT = "free-model-aggregator/1"
+MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+MAX_RETRY_AFTER_SECONDS = 3600.0
+MAX_STREAK_BACKOFF = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +81,16 @@ def canon(obj):
 def est_tokens(text):
     if not text:
         return 0
+    if not isinstance(text, str):
+        text = str(text)
     return max(1, len(text) // 4)
+
+
+def est_tokens_for_chars(char_count):
+    """Token estimate from a character count, without building a string."""
+    if not char_count:
+        return 0
+    return max(1, char_count // 4)
 
 
 def to_float(value, default=0.0):
@@ -131,7 +150,11 @@ def clean_model_id(raw):
 
 
 def retry_after_seconds(headers):
-    """Retry-After seconds from response headers, or None."""
+    """Retry-After seconds from response headers, or None.
+
+    Numeric values only; an HTTP-date value is ignored (None) and any
+    value is capped so a misbehaving provider cannot park us for hours.
+    """
     if not headers:
         return None
     raw = None
@@ -145,7 +168,9 @@ def retry_after_seconds(headers):
         seconds = float(str(raw).strip())
     except ValueError:
         return None
-    return seconds if seconds >= 0 else 0.0
+    if seconds < 0:
+        return 0.0
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
 
 
 class ProviderError(Exception):
@@ -182,7 +207,6 @@ def wire_name(raw):
     if "openai" in text or "chat" in text or "completion" in text:
         return "openai"
     return text or "openai"
-
 
 def normalize_provider(raw, index):
     """One provider entry from the brief, in our own flat shape."""
@@ -413,7 +437,6 @@ def endpoint_for(provider, env_url, kind, model_id=None):
         return _join(base, "/v1/models")
     raise ValueError("unknown endpoint kind %r" % kind)
 
-
 def auth_headers(provider):
     """Auth headers for one provider, from its declared scheme."""
     headers = {}
@@ -477,6 +500,10 @@ def http_request(method, url, headers, body_bytes, timeout):
     request = urllib.request.Request(url, data=body_bytes, method=method)
     for name, value in headers.items():
         request.add_header(name, value)
+    # urllib sends a Python-urllib User-Agent by default; identify the
+    # aggregator instead so the trial harness can tell our calls apart.
+    if not any(name.lower() == "user-agent" for name in headers):
+        request.add_header("User-Agent", USER_AGENT)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, response.headers, response.read()
@@ -775,7 +802,7 @@ def normalize_openai(body):
                         msg["texts"].append(part)
                     continue
                 ptype = part.get("type")
-                if ptype == "text":
+                if ptype in ("text", "input_text"):
                     if part.get("text"):
                         msg["texts"].append(part["text"])
                 elif ptype in ("image_url", "image"):
@@ -836,7 +863,6 @@ def normalize_openai(body):
         "include_usage": bool(stream_options.get("include_usage")),
         "requested_model": body.get("model"),
     }
-
 
 def normalize_anthropic(body):
     system_raw = body.get("system")
@@ -928,7 +954,9 @@ def requirements_of(norm):
         for result in msg["tool_results"]:
             text_chars += len(result["content"])
         image_count += len(msg["images"])
-    est_input = est_tokens("x" * text_chars) + 1024 * image_count + 50 * len(norm["tools"])
+    # Count characters, not a throwaway string: a long conversation
+    # would otherwise allocate a copy of its full text just to divide.
+    est_input = est_tokens_for_chars(text_chars) + 1024 * image_count + 50 * len(norm["tools"])
     return {
         "tools": bool(norm["tools"]),
         "images": image_count > 0,
@@ -1096,7 +1124,6 @@ def anthropic_request_body(norm, model_id):
         else:
             body["tool_choice"] = {"type": "auto"}
     return body
-
 
 def _gemini_parts(msg):
     parts = []
@@ -1369,7 +1396,6 @@ def parse_anthropic_response(body_bytes, content_type=""):
         result["stop"] = "tool_calls"
     return result
 
-
 def parse_gemini_response(body_bytes, content_type=""):
     result = _fresh_result()
     text = body_bytes.decode("utf-8", errors="replace").strip()
@@ -1559,7 +1585,6 @@ def render_anthropic_json(result, model_id, norm, req, seed, counter):
     }
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-
 def render_anthropic_sse(result, model_id, norm, req, seed, counter):
     in_tokens, out_tokens = _usage_for(result, norm, req)
     resp_id = deterministic_id(seed, counter, "msg_", model_id)
@@ -1651,8 +1676,10 @@ class Circuit:
         if cooldown is None:
             self.open_until = float("inf")
         else:
-            # A streak of short failures earns a longer cooldown.
-            extra = 1.0 * max(0, self.failures - 1)
+            # A streak of short failures earns a longer cooldown, but
+            # the extra backoff is capped so a long streak cannot park
+            # a provider for the rest of the trial by accident.
+            extra = min(MAX_STREAK_BACKOFF, 1.0 * max(0, self.failures - 1))
             self.open_until = max(self.open_until, now + max(0.0, cooldown) + extra)
 
 
@@ -1777,7 +1804,9 @@ class Router:
             raise ProviderError(status, "model unavailable", kind="model")
         if status == 400:
             raise ProviderError(status, "provider rejected request", kind="model")
-        if status and status >= 500:
+        if status == 408 or (status and status >= 500):
+            # 408 (request timeout) is transient like a 5xx: fail over
+            # to another route instead of killing this model.
             raise ProviderError(status, "provider server error", kind="server")
         raise ProviderError(status or 0, "provider error %s" % status, kind="error")
 
@@ -1926,6 +1955,13 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path.rstrip("/") or "/"
         length = to_int(self.headers.get("Content-Length"), 0)
+        if length < 0:
+            length = 0
+        if length > MAX_REQUEST_BODY_BYTES:
+            # Refuse oversized bodies before reading them, so one huge
+            # request cannot stall the server; the error is wire-shaped.
+            self._send_error(413, "request body too large", self._anthropic_wire())
+            return
         raw = self.rfile.read(length) if length > 0 else b""
         if path == "/v1/chat/completions":
             self._handle_chat(raw)
